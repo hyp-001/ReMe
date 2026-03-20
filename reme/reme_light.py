@@ -25,7 +25,7 @@ from agentscope.tool import Toolkit, ToolResponse
 
 from .config import ReMeConfigParser
 from .core import Application
-from .core.utils import get_hf_token_counter, get_std_logger
+from .core.utils import get_logger
 from .memory.file_based import ReMeInMemoryMemory
 from .memory.file_based.components import (
     Compactor,
@@ -36,7 +36,7 @@ from .memory.file_based.components import (
 from .memory.file_based.tools import FileIO, MemorySearch
 from .memory.file_based.utils import AsMsgHandler
 
-logger = get_std_logger()
+logger = get_logger()
 
 
 class ReMeLight(Application):
@@ -58,10 +58,9 @@ class ReMeLight(Application):
         working_path (Path): Absolute path to the working directory.
         memory_path (Path): Path to the memory storage directory.
         tool_result_path (Path): Path to the tool result storage directory.
+        dialog_path (Path): Path to the dialog storage directory for raw conversation records.
         vector_weight (float): Weight for vector search in hybrid search (0-1).
         candidate_multiplier (float): Multiplier for candidate retrieval count.
-        tool_result_threshold (int): Character threshold for tool result compaction.
-        retention_days (int): Number of days to retain tool result files.
         summary_tasks (list[asyncio.Task]): List of active background summary tasks.
     """
 
@@ -77,8 +76,7 @@ class ReMeLight(Application):
         default_file_store_config: dict | None = None,
         vector_weight: float = 0.7,
         candidate_multiplier: float = 3.0,
-        tool_result_threshold: int = 1000,
-        retention_days: int = 7,
+        enable_load_env: bool = False,
     ):
         """
         Initialize the ReMeLight application.
@@ -109,17 +107,15 @@ class ReMeLight(Application):
             candidate_multiplier (float): Multiplier applied to max_results when
                 retrieving candidates for re-ranking. Default 3.0 means 3x more
                 candidates are retrieved than the final result count.
-            tool_result_threshold (int): Character count threshold for tool result
-                compaction. Results exceeding this length will be truncated and
-                saved to files. Default 1000 characters.
-            retention_days (int): Number of days to retain tool result files
-                before automatic cleanup. Default 7 days.
+            enable_load_env (bool): Whether to load environment variables from
+                .env file. Defaults to False.
 
         Note:
             The following directory structure will be created:
                 - {working_dir}/           - Root working directory
                 - {working_dir}/memory/    - Memory storage files
                 - {working_dir}/tool_result/ - Compacted tool result files
+                - {working_dir}/dialog/    - Raw conversation records
         """
         # Initialize working directory structure
         self.working_path = Path(working_dir).absolute()
@@ -128,11 +124,11 @@ class ReMeLight(Application):
         self.memory_path.mkdir(parents=True, exist_ok=True)
         self.tool_result_path = self.working_path / "tool_result"
         self.tool_result_path.mkdir(parents=True, exist_ok=True)
+        self.dialog_path = self.working_path / "dialog"
+        self.dialog_path.mkdir(parents=True, exist_ok=True)
 
         self.vector_weight: float = vector_weight
         self.candidate_multiplier: float = candidate_multiplier
-        self.tool_result_threshold: int = tool_result_threshold
-        self.retention_days: int = retention_days
 
         # Initialize the parent Application class with comprehensive configuration
         super().__init__(
@@ -144,6 +140,7 @@ class ReMeLight(Application):
             config_path="light",
             enable_logo=False,
             log_to_console=False,
+            enable_load_env=enable_load_env,
             parser=ReMeConfigParser,
             default_as_llm_config=default_as_llm_config,
             default_embedding_model_config=default_embedding_model_config,
@@ -178,19 +175,15 @@ class ReMeLight(Application):
         Clean up expired tool result files from the tool result directory.
 
         This method removes tool result files that have exceeded the retention
-        period specified during initialization. It helps manage disk space by
-        automatically removing old, unused tool outputs.
+        period. It helps manage disk space by automatically removing old, unused
+        tool outputs.
 
         Returns:
             int: The number of files that were successfully deleted
         """
         try:
-            # Create a compactor instance with current configuration
-            compactor = ToolResultCompactor(
-                tool_result_dir=self.tool_result_path,
-                tool_result_threshold=self.tool_result_threshold,
-                retention_days=self.retention_days,
-            )
+            # Create a compactor instance with default configuration
+            compactor = ToolResultCompactor(tool_result_dir=self.tool_result_path)
             # Execute cleanup and return count of deleted files
             return compactor.cleanup_expired_files()
         except Exception as e:
@@ -235,7 +228,14 @@ class ReMeLight(Application):
         self._cleanup_tool_results()
         return await super().close()
 
-    async def compact_tool_result(self, messages: list[Msg]) -> list[Msg]:
+    async def compact_tool_result(
+        self,
+        messages: list[Msg],
+        recent_n: int = 1,
+        old_threshold: int = 500,
+        recent_threshold: int = 30000,
+        retention_days: int = 7,
+    ) -> list[Msg]:
         """
         Compact tool results by truncating large outputs and saving full content to files.
 
@@ -247,13 +247,19 @@ class ReMeLight(Application):
         Args:
             messages (list[Msg]): List of messages potentially containing tool results
                 that may need compaction.
+            recent_n (int): Number of recent messages to use recent_threshold for.
+                Default 1.
+            old_threshold (int): Character threshold for old messages. Default 500.
+            recent_threshold (int): Character threshold for recent messages. Default 30000.
+            retention_days (int): Number of days to retain tool result files.
+                Default 7.
 
         Returns:
             list[Msg]: The processed list of messages with large tool results compacted.
                 If an error occurs, returns the original unmodified messages.
 
         Note:
-            - Tool results shorter than tool_result_threshold are left unchanged
+            - Tool results are truncated based on old_threshold/recent_threshold
             - Full content of truncated results is saved to tool_result_path
             - Expired files are automatically cleaned up during this operation
         """
@@ -261,8 +267,10 @@ class ReMeLight(Application):
             # Create compactor with instance configuration
             compactor = ToolResultCompactor(
                 tool_result_dir=self.tool_result_path,
-                tool_result_threshold=self.tool_result_threshold,
-                retention_days=self.retention_days,
+                retention_days=retention_days,
+                recent_n=recent_n,
+                old_threshold=old_threshold,
+                recent_threshold=recent_threshold,
             )
 
             # Execute compaction and get processed messages
@@ -283,7 +291,7 @@ class ReMeLight(Application):
         messages: list[Msg],
         memory_compact_threshold: int,
         memory_compact_reserve: int = 10000,
-        token_counter: HuggingFaceTokenCounter | None = None,
+        as_token_counter: str | HuggingFaceTokenCounter = "default",
     ) -> tuple[list[Msg], list[Msg], bool]:
         """
         Check context size and determine if compaction is needed.
@@ -298,8 +306,7 @@ class ReMeLight(Application):
                 compaction. Messages exceeding this threshold will be split.
             memory_compact_reserve (int): Token count to reserve for recent messages
                 to keep in context. Defaults to 10000 tokens.
-            token_counter (HuggingFaceTokenCounter | None): Token counter for
-                measuring message length. If None, uses default HuggingFace counter.
+            as_token_counter (str | HuggingFaceTokenCounter): The token counter to use.
 
         Returns:
             tuple[list[Msg], list[Msg], bool]: A tuple containing:
@@ -315,13 +322,10 @@ class ReMeLight(Application):
             - is_valid=False indicates tool_use and tool_result are misaligned.
         """
         try:
-            if token_counter is None:
-                token_counter = get_hf_token_counter()
-
             checker = ContextChecker(
                 memory_compact_threshold=memory_compact_threshold,
                 memory_compact_reserve=memory_compact_reserve,
-                token_counter=token_counter,
+                as_token_counter=as_token_counter,
             )
 
             return await checker.call(
@@ -338,7 +342,7 @@ class ReMeLight(Application):
         messages: list[Msg],
         as_llm: str | ChatModelBase = "default",
         as_llm_formatter: str | FormatterBase = "default",
-        token_counter: HuggingFaceTokenCounter | None = None,
+        as_token_counter: str | HuggingFaceTokenCounter = "default",
         language: str = "zh",
         max_input_length: float = 128 * 1024,
         compact_ratio: float = 0.7,
@@ -357,8 +361,8 @@ class ReMeLight(Application):
                 to use for summarization. Defaults to "default".
             as_llm_formatter (str | FormatterBase): Formatter for the language model.
                 Defaults to "default".
-            token_counter (HuggingFaceTokenCounter | None): Token counter for
-                measuring message length. If None, uses default HuggingFace counter.
+            as_token_counter (str | HuggingFaceTokenCounter): Token counter for
+                measuring message length. Defaults to "default".
             language (str): Language for the summary output. "zh" for Chinese,
                 any other value for English. Defaults to "zh".
             max_input_length (float): Maximum input length in tokens for the model.
@@ -373,14 +377,11 @@ class ReMeLight(Application):
                 an error occurred during compaction.
         """
         try:
-            if token_counter is None:
-                token_counter = get_hf_token_counter()
-
             compactor = Compactor(
                 memory_compact_threshold=self.calculate_memory_compact_threshold(max_input_length, compact_ratio),
-                token_counter=token_counter,
                 as_llm=as_llm,
                 as_llm_formatter=as_llm_formatter,
+                as_token_counter=as_token_counter,
                 language=language if language == "zh" else "",
             )
 
@@ -400,11 +401,12 @@ class ReMeLight(Application):
         messages: list[Msg],
         as_llm: str | ChatModelBase = "default",
         as_llm_formatter: str | FormatterBase = "default",
-        token_counter: HuggingFaceTokenCounter | None = None,
+        as_token_counter: str | HuggingFaceTokenCounter = "default",
         toolkit: Toolkit | None = None,
         language: str = "zh",
         max_input_length: float = 128 * 1024,
         compact_ratio: float = 0.7,
+        timezone: str | None = None,
     ) -> str:
         """
         Generate a comprehensive summary of the given messages.
@@ -419,8 +421,8 @@ class ReMeLight(Application):
                 for summarization. Defaults to "default".
             as_llm_formatter (str | FormatterBase): Formatter for the language model.
                 Defaults to "default".
-            token_counter (HuggingFaceTokenCounter | None): Token counter for
-                measuring message length. If None, uses default HuggingFace counter.
+            as_token_counter (str | HuggingFaceTokenCounter): Token counter for
+                measuring message length. Defaults to "default".
             toolkit (Toolkit | None): Toolkit with file operations for persisting
                 summaries. If None, creates a default toolkit with read/write/edit.
             language (str): Language for the summary output. "zh" for Chinese,
@@ -429,6 +431,8 @@ class ReMeLight(Application):
                 Defaults to 128K tokens.
             compact_ratio (float): Ratio used to calculate compaction threshold.
                 Defaults to 0.7.
+            timezone (str | None): Timezone string for date formatting
+                (e.g., "America/Chicago"). Defaults to system local time if None.
 
         Returns:
             str: The generated summary text, or an empty string if an error occurred.
@@ -438,9 +442,6 @@ class ReMeLight(Application):
             using the provided or default toolkit.
         """
         try:
-            if token_counter is None:
-                token_counter = get_hf_token_counter()
-
             if toolkit is None:
                 toolkit = Toolkit()
                 file_io = FileIO(working_dir=str(self.working_path))
@@ -452,11 +453,12 @@ class ReMeLight(Application):
                 working_dir=str(self.working_path),
                 memory_dir=str(self.memory_path),
                 memory_compact_threshold=self.calculate_memory_compact_threshold(max_input_length, compact_ratio),
-                token_counter=token_counter,
                 toolkit=toolkit,
                 as_llm=as_llm,
                 as_llm_formatter=as_llm_formatter,
+                as_token_counter=as_token_counter,
                 language=language if language == "zh" else "",
+                timezone=timezone,
             )
 
             return await summarizer.call(messages=messages, service_context=self.service_context)
@@ -479,7 +481,7 @@ class ReMeLight(Application):
                 Supported arguments include:
                 - as_llm: Language model identifier or instance
                 - as_llm_formatter: Formatter for the language model
-                - token_counter: Token counter instance
+                - as_token_counter: Token counter instance
                 - toolkit: Toolkit for file operations
                 - language: Output language ("zh" or other)
                 - max_input_length: Maximum input token length
@@ -509,6 +511,16 @@ class ReMeLight(Application):
         task = asyncio.create_task(self.summary_memory(messages=messages, **kwargs))
         self.summary_tasks.append(task)
 
+    @property
+    def default_as_token_counter(self) -> HuggingFaceTokenCounter:
+        """
+        Get the default token counter for the memory.
+
+        Returns:
+            HuggingFaceTokenCounter: The default token counter instance.
+        """
+        return self.service_context.as_token_counters["default"]
+
     async def pre_reasoning_hook(
         self,
         messages: list[Msg],
@@ -516,7 +528,7 @@ class ReMeLight(Application):
         compressed_summary: str = "",
         as_llm: str | ChatModelBase = "default",
         as_llm_formatter: str | FormatterBase = "default",
-        token_counter: HuggingFaceTokenCounter | None = None,
+        as_token_counter: str | HuggingFaceTokenCounter = "default",
         toolkit: Toolkit | None = None,
         language: str = "zh",
         max_input_length: float = 128 * 1024,
@@ -542,8 +554,8 @@ class ReMeLight(Application):
                 Defaults to "default".
             as_llm_formatter (str | FormatterBase): Formatter for the language model.
                 Defaults to "default".
-            token_counter (HuggingFaceTokenCounter | None): Token counter for
-                measuring content length. If None, uses default counter.
+            as_token_counter (str | HuggingFaceTokenCounter): Token counter for
+                measuring content length. Defaults to "default".
             toolkit (Toolkit | None): Toolkit for file operations in summarization.
                 Defaults to None.
             language (str): Language for generated summaries. Defaults to "zh".
@@ -568,13 +580,10 @@ class ReMeLight(Application):
             - Tool results in recent messages (keep_n) are not compacted
             - Returns original messages unchanged if no compaction is needed
         """
-        if token_counter is None:
-            token_counter = get_hf_token_counter()
+        msg_handler = AsMsgHandler(self.default_as_token_counter)
 
-        msg_handler = AsMsgHandler(token_counter=token_counter)
-
-        system_token_count = msg_handler.count_str_token(system_prompt)
-        compressed_token_count = msg_handler.count_str_token(compressed_summary)
+        system_token_count = await msg_handler.count_str_token(system_prompt)
+        compressed_token_count = await msg_handler.count_str_token(compressed_summary)
         memory_compact_threshold = self.calculate_memory_compact_threshold(max_input_length, compact_ratio)
         left_compact_threshold = memory_compact_threshold - (system_token_count + compressed_token_count)
         logger.info(f"Left compact threshold: {left_compact_threshold}")
@@ -587,7 +596,7 @@ class ReMeLight(Application):
             messages=messages,
             memory_compact_threshold=left_compact_threshold,
             memory_compact_reserve=memory_compact_reserve,
-            token_counter=token_counter,
+            as_token_counter=as_token_counter,
         )
 
         if not messages_to_compact:
@@ -601,7 +610,7 @@ class ReMeLight(Application):
             messages=messages_to_compact,
             as_llm=as_llm,
             as_llm_formatter=as_llm_formatter,
-            token_counter=token_counter,
+            as_token_counter=as_token_counter,
             toolkit=toolkit,
             language=language,
             max_input_length=max_input_length,
@@ -612,7 +621,7 @@ class ReMeLight(Application):
             messages=messages_to_compact,
             as_llm=as_llm,
             as_llm_formatter=as_llm_formatter,
-            token_counter=token_counter,
+            as_token_counter=as_token_counter,
             language=language,
             max_input_length=max_input_length,
             compact_ratio=compact_ratio,
@@ -755,28 +764,31 @@ class ReMeLight(Application):
             ],
         )
 
-    @staticmethod
-    def get_in_memory_memory(token_counter: HuggingFaceTokenCounter | None = None):
+    def get_in_memory_memory(self, as_token_counter: HuggingFaceTokenCounter | None = None):
         """
         Create and return an in-memory memory instance.
 
         Factory method to create a ReMeInMemoryMemory instance configured with
-        the specified token counter. This memory instance stores data in RAM
-        without persistence, suitable for temporary or session-based storage.
+        the specified token counter. This memory instance stores messages in RAM
+        during the session, and automatically persists them to dialog_path when
+        messages are compressed or cleared.
 
         Args:
-            token_counter (HuggingFaceTokenCounter | None): Token counter for
-                measuring content length in the memory. If None, creates a
-                default HuggingFace token counter.
+            as_token_counter (HuggingFaceTokenCounter): Token counter for
+                measuring content length in the memory.
 
         Returns:
             ReMeInMemoryMemory: A new in-memory memory instance ready for use.
+                The instance is configured with self.dialog_path for persistence.
 
-        Example:
-            >>> memory = ReMeLight.get_in_memory_memory()
-            >>> # Use memory for temporary storage during a session
+        Note:
+            - Messages are stored in RAM during active session
+            - When messages are compressed via mark_messages_compressed(), they
+              are persisted to {dialog_path}/{date}.jsonl files
+            - When clear_content() is called, all messages are persisted before
+              clearing from memory
         """
-        if token_counter is None:
-            token_counter = get_hf_token_counter()
-
-        return ReMeInMemoryMemory(token_counter=token_counter)
+        return ReMeInMemoryMemory(
+            token_counter=as_token_counter or self.default_as_token_counter,
+            dialog_path=str(self.dialog_path),
+        )

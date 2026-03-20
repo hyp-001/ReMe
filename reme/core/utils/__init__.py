@@ -11,7 +11,7 @@ from .horse import play_horse_easter_egg
 from .http_client import HttpClient
 from .llm_utils import extract_content, format_messages, deduplicate_memories
 from .logger_utils import init_logger
-from .std_logger import get_logger as get_std_logger
+from .std_logger import get_logger
 from .logo_utils import print_logo
 from .mcp_client import MCPClient
 from .pydantic_config_parser import PydanticConfigParser
@@ -19,7 +19,7 @@ from .pydantic_utils import create_pydantic_model
 from .singleton import singleton
 from .time import timer, get_now_time
 from .hf_token_counter_utils import get_hf_token_counter
-from .truncate_text_utils import truncate_text, is_truncated
+from .truncate_text_utils import truncate_text, truncate_text_head, is_truncated, TRUNCATION_MARKER_START
 
 __all__ = [
     "convert_dashscope_to_agentscope",
@@ -42,7 +42,7 @@ __all__ = [
     "format_messages",
     "deduplicate_memories",
     "init_logger",
-    "get_std_logger",
+    "get_logger",
     "print_logo",
     "MCPClient",
     "PydanticConfigParser",
@@ -52,5 +52,7 @@ __all__ = [
     "get_now_time",
     "get_hf_token_counter",
     "truncate_text",
+    "truncate_text_head",
     "is_truncated",
+    "TRUNCATION_MARKER_START",
 ]
